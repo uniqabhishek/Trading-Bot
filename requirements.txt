@@ -1,7 +1,8 @@
-python-telegram-bot[webhooks]>=21.0
+python-telegram-bot>=21.0
+quart
+hypercorn
 ccxt
 pandas
 numpy
 yfinance
-flask
 requests
