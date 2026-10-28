@@ -1,23 +1,29 @@
+"""
+Telegram Signal Bot — Render Webhook Edition
+Runs a Web Server (Quart) and receives Telegram messages via Webhooks.
+"""
+
 import os
 import asyncio
-import threading
-import time
-import requests
 import ccxt
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from flask import Flask
+from quart import Quart, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# CONFIG
+# CONFIG (Must be set in Render Environment Variables)
 # ============================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN env var not set!")
 
+ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
+ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else None
+
+# Strategy constants
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 3.0
 VOLUME_MULT = 1.5
@@ -28,7 +34,7 @@ YF_PERIOD   = {'1m':'7d','5m':'60d','15m':'60d','1h':'730d','4h':'730d','1d':'5y
 binance = ccxt.binance()
 
 # ============================================================
-# DATA + INDICATORS (same as before, no changes)
+# DATA + INDICATORS
 # ============================================================
 def fetch_btc_data(timeframe, limit=300):
     ohlcv = binance.fetch_ohlcv('BTC/USDT', timeframe, limit=limit)
@@ -90,15 +96,13 @@ def raw_signal(row):
 
 def layered_signal(entry_row, higher_row):
     base = raw_signal(entry_row)
-    if base == 'HOLD':
-        return 'HOLD', "No base signal"
-    if pd.isna(higher_row['EMA_200']):
-        return 'HOLD', "Higher TF data insufficient"
+    if base == 'HOLD': return 'HOLD', "No base signal"
+    if pd.isna(higher_row['EMA_200']): return 'HOLD', "Higher TF data insufficient"
+
     trend = 'UP' if higher_row['close'] > higher_row['EMA_200'] else 'DOWN'
-    if base == 'BUY' and trend != 'UP':
-        return 'HOLD', f"Base BUY rejected: higher TF is {trend}"
-    if base == 'SELL' and trend != 'DOWN':
-        return 'HOLD', f"Base SELL rejected: higher TF is {trend}"
+    if base == 'BUY' and trend != 'UP': return 'HOLD', f"Base BUY rejected: higher TF is {trend}"
+    if base == 'SELL' and trend != 'DOWN': return 'HOLD', f"Base SELL rejected: higher TF is {trend}"
+
     if pd.isna(entry_row['vol_ma_20']) or entry_row['volume'] < VOLUME_MULT * entry_row['vol_ma_20']:
         return 'HOLD', "Volume too low (needs 1.5x avg)"
     return base, f"All layers aligned (higher TF: {trend})"
@@ -109,13 +113,14 @@ def get_signal(asset, timeframe):
         raise ValueError(f"Invalid timeframe. Use: {', '.join(HIGHER_TF.keys())}")
     entry_df  = calculate_indicators(fetch_data(asset, timeframe))
     higher_df = calculate_indicators(fetch_data(asset, HIGHER_TF[timeframe]))
-    if len(entry_df) < 210:
-        raise ValueError(f"Not enough candles ({len(entry_df)}/210)")
+    if len(entry_df) < 210: raise ValueError(f"Not enough candles ({len(entry_df)}/210)")
+
     entry_row  = entry_df.iloc[-2]
     higher_row = higher_df.iloc[-2]
     signal, reason = layered_signal(entry_row, higher_row)
     price = float(entry_row['close'])
     atr   = float(entry_row['ATR_14']) if not pd.isna(entry_row['ATR_14']) else price * 0.005
+
     if signal == 'BUY':
         sl, tp = price - ATR_SL_MULT * atr, price + ATR_TP_MULT * atr
     elif signal == 'SELL':
@@ -139,9 +144,17 @@ def format_signal(s):
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
+def check_auth(update: Update) -> bool:
+    if ALLOWED_CHAT_ID and update.effective_chat.id != ALLOWED_CHAT_ID:
+        return False
+    return True
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update):
+        await update.message.reply_text("🔒 Unauthorized")
+        return
     await update.message.reply_text(
-        "🤖 *Crypto Signal Bot — 24/7 on Render*\n\n"
+        "🤖 *Crypto Signal Bot — 24/7 Webhook Mode*\n\n"
         "Commands:\n• `/signal BTC 15m`\n• `/signal GOLD 1h`\n\n"
         "Timeframes: `1m 5m 15m 1h 4h 1d`\nAssets: `BTC GOLD`",
         parse_mode="Markdown"
@@ -151,6 +164,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_auth(update): return
     if len(context.args) != 2:
         await update.message.reply_text("❌ Usage: `/signal BTC 15m`", parse_mode="Markdown")
         return
@@ -163,61 +177,62 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 # ============================================================
-# TELEGRAM BOT THREAD
+# TELEGRAM APP & QUART WEB SERVER
 # ============================================================
-def run_telegram_bot():
-    print("🚀 Starting Telegram bot...")
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("signal", cmd_signal))
-    print("✅ Telegram bot polling started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+telegram_app.add_handler(CommandHandler("start",  cmd_start))
+telegram_app.add_handler(CommandHandler("help",   cmd_help))
+telegram_app.add_handler(CommandHandler("signal", cmd_signal))
 
-# ============================================================
-# FLASK WEB SERVICE (main thread — this is what Render monitors)
-# ============================================================
-flask_app = Flask(__name__)
+web_app = Quart(__name__)
 
-@flask_app.route('/')
-def health():
+@web_app.route('/')
+@web_app.route('/healthz')
+async def health():
     return "Bot is running", 200
 
-@flask_app.route('/healthz')
-def healthz():
-    return {"status": "ok"}, 200
+@web_app.route('/webhook', methods=['POST'])
+async def telegram_webhook():
+    """Receives updates from Telegram."""
+    data = await request.get_json(force=True)
+    update = Update.de_json(data=data, bot=telegram_app.bot)
+    await telegram_app.update_queue.put(update)
+    return "OK", 200
 
 # ============================================================
-# SELF-PING (optional; UptimeRobot is more reliable)
+# STARTUP LOGIC
 # ============================================================
-def self_ping():
-    time.sleep(45)
-    url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url:
-        print("⚠️  RENDER_EXTERNAL_URL not set — self-ping disabled")
-        return
-    ping_url = url.rstrip('/') + '/healthz'
-    print(f"🔁 Self-ping enabled: {ping_url}")
-    while True:
-        try:
-            r = requests.get(ping_url, timeout=10)
-            print(f"🔁 Ping {r.status_code}")
-        except Exception as e:
-            print(f"⚠️  Ping error: {e}")
-        time.sleep(14 * 60)
-
-# ============================================================
-# MAIN — Flask in main thread, Telegram in daemon thread
-# ============================================================
-if __name__ == "__main__":
-    # Start Telegram bot in background
-    threading.Thread(target=run_telegram_bot, daemon=True).start()
-
-    # Start self-ping in background (optional)
-    threading.Thread(target=self_ping, daemon=True).start()
-
-    # Start Flask in MAIN thread — this is what Render port-scans
+async def main():
+    # 1. Initialize Telegram App
+    await telegram_app.initialize()
+    
+    # 2. Set Webhook URL using Render's URL environment variable
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        webhook_url = f"{render_url}/webhook"
+        print(f"🔗 Setting webhook to: {webhook_url}")
+        await telegram_app.bot.set_webhook(url=webhook_url)
+    else:
+        print("⚠️ RENDER_EXTERNAL_URL not set. Webhook not configured (Are you running locally?)")
+    
+    # 3. Start the Telegram app (begins processing updates)
+    await telegram_app.start()
+    
+    # 4. Start Quart server on the port Render expects
     port = int(os.getenv("PORT", 10000))
-    print(f"🌐 Flask listening on 0.0.0.0:{port}")
-    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+    print(f"🌐 Quart web server listening on 0.0.0.0:{port}")
+    
+    # Hypercorn is needed to run Quart in production
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+    
+    await serve(web_app, config)
+    
+    # 5. Cleanup on shutdown
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
