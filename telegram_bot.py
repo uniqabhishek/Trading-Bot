@@ -1,6 +1,5 @@
 """
-Professional Telegram Signal Bot
-Features: Webhooks, Auto-Scanner, Backtester (with Capital PnL %), Failover.
+Professional Telegram Signal Bot - Fully Stable Version
 """
 
 import os
@@ -23,11 +22,10 @@ if not TELEGRAM_TOKEN:
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else None
 
-# Strategy Constants
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 3.0
 VOLUME_MULT = 1.5
-RISK_PER_TRADE = 0.01  # Risk 1% of capital per trade
+RISK_PER_TRADE = 0.01
 
 HIGHER_TF = {'1m': '15m', '5m': '1h', '15m': '1h', '1h': '4h', '4h': '1d', '1d': '1d'}
 YF_INTERVAL = {'1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'1h','1d':'1d'}
@@ -97,8 +95,45 @@ def layered_signal(entry_row, higher_row):
     if pd.isna(entry_row['vol_ma_20']) or entry_row['volume'] < VOLUME_MULT * entry_row['vol_ma_20']: return 'HOLD'
     return base
 
+def get_signal(asset, timeframe):
+    entry_df = calculate_indicators(fetch_data(asset, timeframe))
+    higher_df = calculate_indicators(fetch_data(asset, HIGHER_TF[timeframe]))
+    if len(entry_df) < 210: raise ValueError("Not enough data")
+    
+    entry_row = entry_df.iloc[-2]
+    higher_row = higher_df.iloc[-2]
+    sig = layered_signal(entry_row, higher_row)
+    price = float(entry_row['close'])
+    atr = float(entry_row['ATR_14']) if not pd.isna(entry_row['ATR_14']) else price * 0.005
+    
+    if sig == 'BUY': sl, tp = price - ATR_SL_MULT*atr, price + ATR_TP_MULT*atr
+    elif sig == 'SELL': sl, tp = price + ATR_SL_MULT*atr, price - ATR_TP_MULT*atr
+    else: sl = tp = None
+    
+    return {"asset": asset.upper(), "timeframe": timeframe, "signal": sig, "price": price, "sl": sl, "tp": tp, "timestamp": pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+
+def format_price(asset, price):
+    if price is None: return "N/A"
+    return f"${price:,.0f}" if asset == 'BTC' else f"${price:,.2f}"
+
+def format_signal(s):
+    if s['signal'] == 'HOLD':
+        return (f"⚪ *HOLD — {s['asset']} / {s['timeframe']}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Price: `{format_price(s['asset'], s['price'])}`\n"
+                f"🕐 {s['timestamp']}")
+    emoji = "🟢" if s['signal'] == 'BUY' else "🔴"
+    return (f"{emoji} *{s['signal']} — {s['asset']} / {s['timeframe']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Entry:       `{format_price(s['asset'], s['price'])}`\n"
+            f"🛑 Stop Loss:   `{format_price(s['asset'], s['sl'])}`\n"
+            f"🎯 Take Profit: `{format_price(s['asset'], s['tp'])}`\n"
+            f"⚖️ R:R Ratio:   `1:2.0`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {s['timestamp']}")
+
 # ============================================================
-# BACKTESTING ENGINE (With Capital %)
+# BACKTESTING ENGINE
 # ============================================================
 def run_backtest(asset, timeframe):
     entry_df  = calculate_indicators(fetch_data(asset, timeframe))
@@ -132,9 +167,8 @@ def run_backtest(asset, timeframe):
                 if c['high'] >= sl: outcome = 'LOSS'; break
                 if c['low'] <= tp: outcome = 'WIN'; break
 
-        if not outcome: continue # Timeout
+        if not outcome: continue
 
-        # Apply PnL to balance (1% risk, 1:2 R:R -> Win = +2%, Loss = -1%)
         if outcome == 'WIN':
             balance += balance * RISK_PER_TRADE * (ATR_TP_MULT / ATR_SL_MULT)
             wins += 1
@@ -151,32 +185,47 @@ def run_backtest(asset, timeframe):
 
     win_rate = (wins / total) * 100
     profit_pct = ((balance - 1000) / 1000) * 100
-    profit_factor = (wins * ATR_TP_MULT) / (losses * ATR_SL_MULT) if losses > 0 else float('inf')
     
     result = (
         f"📊 *BACKTEST: {asset.upper()} / {timeframe}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕰️ Data: {len(entry_df)} candles\n"
-        f"📈 Total Trades: {total}\n"
-        f"✅ Wins: {wins} | ❌ Losses: {losses}\n"
+        f"📈 Total Trades: {total} (✅ {wins} | ❌ {losses})\n"
         f"🎯 *Win Rate: {win_rate:.1f}%*\n"
-        f"⚖️ Profit Factor: {profit_factor:.2f}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *Starting Capital:* $1,000\n"
-        f"💵 *Ending Capital:* ${balance:,.2f}\n"
-        f"📈 *Total Profit:* {profit_pct:+.1f}%\n"
+        f"💰 *Start:* $1,000\n"
+        f"💵 *End:* ${balance:,.2f}\n"
+        f"📈 *Profit:* {profit_pct:+.1f}%\n"
         f"📉 *Max Drawdown:* {max_drawdown*100:.1f}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
-    if win_rate >= 55: result += "🟢 *Verdict:* Strategy has a proven edge."
-    elif win_rate >= 45: result += "🟡 *Verdict:* Breakeven. Needs work."
-    else: result += "🔴 *Verdict:* Poor performance. Do not trade live."
-
     return result
 
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Pro Crypto Bot*\n\n"
+        "• `/signal BTC 15m`\n"
+        "• `/backtest BTC 1h`\n"
+        "• `/price GOLD`\n"
+        "• `/status`\n\n"
+        "Timeframes: `1m 5m 15m 1h 4h 1d`",
+        parse_mode="Markdown"
+    )
+
+async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text("❌ Usage: `/signal BTC 15m`")
+        return
+    asset, timeframe = context.args[0].upper(), context.args[1].lower()
+    msg = await update.message.reply_text(f"⏳ Analyzing {asset} on {timeframe}...")
+    try:
+        result = await asyncio.to_thread(get_signal, asset, timeframe)
+        await msg.edit_text(format_signal(result), parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {str(e)[:200]}")
+
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.message.reply_text("❌ Usage: `/backtest BTC 15m`")
@@ -188,14 +237,17 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Pro Crypto Bot*\n\n"
-        "• `/signal BTC 15m` - Live signal\n"
-        "• `/backtest BTC 1h` - Test accuracy & profit %\n"
-        "• `/status` - Bot health",
-        parse_mode="Markdown"
-    )
+async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ Usage: `/price BTC`")
+        return
+    asset = context.args[0].upper()
+    try:
+        df = fetch_data(asset, '15m')
+        price = float(df.iloc[-1]['close'])
+        await update.message.reply_text(f"💵 *{asset}:* `{format_price(asset, price)}`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot Online\nExchanges: MEXC / Gate.io\nGold: Yahoo Finance")
@@ -205,7 +257,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 telegram_app.add_handler(CommandHandler("start", cmd_start))
+telegram_app.add_handler(CommandHandler("signal", cmd_signal))
 telegram_app.add_handler(CommandHandler("backtest", cmd_backtest))
+telegram_app.add_handler(CommandHandler("price", cmd_price))
 telegram_app.add_handler(CommandHandler("status", cmd_status))
 
 web_app = Quart(__name__)
