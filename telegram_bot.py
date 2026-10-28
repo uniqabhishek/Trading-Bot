@@ -45,7 +45,7 @@ YF_PERIOD   = {'1m':'7d','5m':'60d','15m':'60d','1h':'730d','4h':'730d','1d':'5y
 
 # Initialize Exchanges for Failover
 exchange_mexc = ccxt.mexc()
-exchange_gate = ccxt.gateio()
+exchange_gate = ccxt.gate()
 
 # Memory to prevent duplicate auto-alerts
 last_signals = {} 
