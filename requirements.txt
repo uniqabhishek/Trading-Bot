@@ -2,3 +2,5 @@ python-telegram-bot
 ccxt
 pandas
 yfinance
+flask
+requests
