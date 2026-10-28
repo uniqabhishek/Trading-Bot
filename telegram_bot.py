@@ -1,6 +1,7 @@
 """
 Professional Telegram Signal Bot
 Features: Webhooks, Auto-Scanner, Retry Logic, Exchange Failover (MEXC -> Gate.io).
+Supports Timeframes: 1m, 5m, 15m, 1h, 4h, 1d.
 """
 
 import os
@@ -27,7 +28,18 @@ ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else None
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 3.0
 VOLUME_MULT = 1.5
-HIGHER_TF   = {'15m':'1h', '1h':'4h', '4h':'1d'}
+
+# MAPPING HIGHER TIMEFRAMES (e.g. 1m entry checks 15m trend)
+HIGHER_TF   = {
+    '1m': '15m', 
+    '5m': '1h', 
+    '15m': '1h', 
+    '1h': '4h', 
+    '4h': '1d', 
+    '1d': '1d'
+}
+
+# YAHOO FINANCE MAPPINGS FOR GOLD
 YF_INTERVAL = {'1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'1h','1d':'1d'}
 YF_PERIOD   = {'1m':'7d','5m':'60d','15m':'60d','1h':'730d','4h':'730d','1d':'5y'}
 
@@ -53,10 +65,8 @@ def fetch_with_retry(func, *args, retries=3, **kwargs):
             time.sleep(2)
 
 def fetch_btc_data(timeframe, limit=300):
-    # Convert '1h' to '60m' for MEXC compatibility if needed
+    # MEXC requires '60m' instead of '1h'
     mexc_tf = '60m' if timeframe == '1h' else timeframe
-    mexc_tf = '4h' if timeframe == '4h' else mexc_tf
-    mexc_tf = '1d' if timeframe == '1d' else mexc_tf
 
     try:
         # Try MEXC first
@@ -75,15 +85,18 @@ def fetch_gold_data(timeframe):
     period   = YF_PERIOD[timeframe]
     hist = fetch_with_retry(yf.Ticker("GC=F").history, period=period, interval=interval)
     if hist.empty:
-        raise ValueError("No Gold data from Yahoo Finance")
+        raise ValueError(f"No Gold data from Yahoo Finance for {timeframe}")
+    
     df = hist.reset_index()
     df.rename(columns={'Datetime':'timestamp','Date':'timestamp','Open':'open',
                        'High':'high','Low':'low','Close':'close','Volume':'volume'},
               inplace=True)
+              
     if timeframe == '4h':
         df = df.set_index('timestamp').resample('4H').agg({
             'open':'first','high':'max','low':'min','close':'last','volume':'sum'
         }).dropna().reset_index()
+        
     return df[['timestamp','open','high','low','close','volume']].tail(300).reset_index(drop=True)
 
 def fetch_data(asset, timeframe):
@@ -136,7 +149,7 @@ def get_signal(asset, timeframe):
     entry_df  = calculate_indicators(fetch_data(asset, timeframe))
     higher_df = calculate_indicators(fetch_data(asset, HIGHER_TF[timeframe]))
 
-    if len(entry_df) < 210: raise ValueError(f"Not enough candles ({len(entry_df)}/210)")
+    if len(entry_df) < 210: raise ValueError(f"Not enough candles ({len(entry_df)}/210) for {timeframe}")
     
     entry_row  = entry_df.iloc[-2]
     higher_row = higher_df.iloc[-2]
@@ -189,7 +202,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/price GOLD` - Get live price\n"
         "• `/scan` - Run auto-scanner manually\n"
         "• `/status` - Check bot health\n\n"
-        "Timeframes: `15m 1h 4h`\nAssets: `BTC GOLD`",
+        "Timeframes: `1m 5m 15m 1h 4h 1d`\nAssets: `BTC GOLD`",
         parse_mode="Markdown"
     )
 
@@ -232,7 +245,8 @@ async def run_market_scanner(bot, force=False, chat_id=None):
     if not target_chat: return
 
     assets = ['BTC', 'GOLD']
-    timeframes = ['15m', '1h', '4h']
+    # Auto-scanner checks a healthy mix of timeframes so it doesn't spam API limits
+    timeframes = ['15m', '1h', '4h'] 
 
     for asset in assets:
         for tf in timeframes:
