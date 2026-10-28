@@ -1,6 +1,6 @@
 """
 Professional Telegram Signal Bot
-Features: Webhooks, Auto-Scanner, Retry Logic, Smart Formatting.
+Features: Webhooks, Auto-Scanner, Retry Logic, Exchange Failover (MEXC -> Gate.io).
 """
 
 import os
@@ -20,7 +20,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN env var not set!")
 
-# Optional: Your Chat ID for auto-scanner alerts
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else None
 
@@ -32,13 +31,15 @@ HIGHER_TF   = {'15m':'1h', '1h':'4h', '4h':'1d'}
 YF_INTERVAL = {'1m':'1m','5m':'5m','15m':'15m','1h':'1h','4h':'1h','1d':'1d'}
 YF_PERIOD   = {'1m':'7d','5m':'60d','15m':'60d','1h':'730d','4h':'730d','1d':'5y'}
 
-binance = ccxt.binance()
+# Initialize Exchanges for Failover
+exchange_mexc = ccxt.mexc()
+exchange_gate = ccxt.gateio()
 
 # Memory to prevent duplicate auto-alerts
 last_signals = {} 
 
 # ============================================================
-# DATA & INDICATORS (With Retry Logic)
+# DATA & INDICATORS (With Retry & Failover Logic)
 # ============================================================
 def fetch_with_retry(func, *args, retries=3, **kwargs):
     """Professional reliability: retry network calls on failure."""
@@ -49,10 +50,22 @@ def fetch_with_retry(func, *args, retries=3, **kwargs):
             if attempt == retries - 1:
                 raise e
             import time
-            time.sleep(2)  # wait 2 seconds before retrying
+            time.sleep(2)
 
 def fetch_btc_data(timeframe, limit=300):
-    ohlcv = fetch_with_retry(binance.fetch_ohlcv, 'BTC/USDT', timeframe, limit=limit)
+    # Convert '1h' to '60m' for MEXC compatibility if needed
+    mexc_tf = '60m' if timeframe == '1h' else timeframe
+    mexc_tf = '4h' if timeframe == '4h' else mexc_tf
+    mexc_tf = '1d' if timeframe == '1d' else mexc_tf
+
+    try:
+        # Try MEXC first
+        ohlcv = fetch_with_retry(exchange_mexc.fetch_ohlcv, 'BTC/USDT', mexc_tf, limit=limit)
+    except Exception as e:
+        print(f"MEXC failed ({e}), falling back to Gate.io...")
+        # If MEXC fails (geoblock or rate limit), fallback to Gate.io
+        ohlcv = fetch_with_retry(exchange_gate.fetch_ohlcv, 'BTC/USDT', timeframe, limit=limit)
+        
     df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
@@ -145,8 +158,8 @@ def get_signal(asset, timeframe):
 # ============================================================
 def format_price(asset, price):
     if price is None: return "N/A"
-    if asset == 'BTC': return f"${price:,.0f}"  # No decimals for BTC
-    return f"${price:,.2f}"                     # 2 decimals for Gold
+    if asset == 'BTC': return f"${price:,.0f}"
+    return f"${price:,.2f}"
 
 def format_signal(s):
     if s['signal'] == 'HOLD':
@@ -190,7 +203,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = float(df.iloc[-1]['close'])
         await update.message.reply_text(f"💵 *{asset} Live Price:* `{format_price(asset, price)}`", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
@@ -206,20 +219,17 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scanning market for setups...")
-    # The actual scan logic runs in the background task, we just trigger a check here
     await run_market_scanner(context.bot, force=True, chat_id=update.effective_chat.id)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ *Bot is Online & Healthy*\nWebhook: Active\nData Feeds: Binance & Yahoo Finance", parse_mode="Markdown")
+    await update.message.reply_text("✅ *Bot is Online & Healthy*\nWebhook: Active\nData Feeds: MEXC/Gate & Yahoo Finance", parse_mode="Markdown")
 
 # ============================================================
 # BACKGROUND AUTO-SCANNER
 # ============================================================
 async def run_market_scanner(bot, force=False, chat_id=None):
-    """Background task: Scans markets and alerts if signals found."""
     target_chat = chat_id or ALLOWED_CHAT_ID
-    if not target_chat:
-        return  # No chat ID configured to send to
+    if not target_chat: return
 
     assets = ['BTC', 'GOLD']
     timeframes = ['15m', '1h', '4h']
@@ -227,30 +237,20 @@ async def run_market_scanner(bot, force=False, chat_id=None):
     for asset in assets:
         for tf in timeframes:
             try:
-                # Run blocking data fetch in a thread
                 result = await asyncio.to_thread(get_signal, asset, tf)
-                
-                # If it's a BUY or SELL, check if we already alerted recently
                 if result['signal'] in ('BUY', 'SELL'):
                     sig_key = f"{asset}_{tf}"
                     last_sig = last_signals.get(sig_key)
-                    
-                    # Only alert if the signal changed or it's a forced scan
                     if last_sig != result['signal'] or force:
                         last_signals[sig_key] = result['signal']
                         alert_text = f"🚨 *AUTO-SCANNER ALERT*\n\n{format_signal(result)}"
                         await bot.send_message(chat_id=target_chat, text=alert_text, parse_mode="Markdown")
-                        
                 elif result['signal'] == 'HOLD':
-                    # Reset memory if it goes back to HOLD so we can alert again next time
                     sig_key = f"{asset}_{tf}"
-                    if sig_key in last_signals:
-                        del last_signals[sig_key]
-                        
+                    if sig_key in last_signals: del last_signals[sig_key]
             except Exception as e:
                 print(f"Scanner error on {asset} {tf}: {e}")
-            
-            await asyncio.sleep(2)  # Prevent rate-limiting from Binance
+            await asyncio.sleep(2)
 
 # ============================================================
 # QUART WEB SERVER & WEBHOOK
@@ -278,11 +278,10 @@ async def telegram_webhook():
     return "OK", 200
 
 async def auto_scanner_loop(bot):
-    """Runs every 15 minutes."""
     while True:
         print("🔍 Running auto-scanner...")
         await run_market_scanner(bot)
-        await asyncio.sleep(900)  # 15 minutes
+        await asyncio.sleep(900)
 
 # ============================================================
 # MAIN STARTUP
@@ -298,7 +297,6 @@ async def main():
     
     await telegram_app.start()
 
-    # Start the background auto-scanner
     asyncio.create_task(auto_scanner_loop(telegram_app.bot))
     
     port = int(os.getenv("PORT", 10000))
